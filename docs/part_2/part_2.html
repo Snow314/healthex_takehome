@@ -1,0 +1,75 @@
+<h1 id="scaling-to-10m-patients">Scaling to 10M Patients</h1>
+<h2 id="current-state-5k">Current State (5K)</h2>
+<ul>
+<li>Postgres + Redis sorted set + stateless Python workers</li>
+<li>Scheduler polls DB every N seconds, pushes to Redis queue</li>
+<li>Workers block on <code>BZPOPMIN</code>, token bucket rate limiting
+per endpoint</li>
+</ul>
+<hr />
+<h2 id="bottlenecks-at-scale">Bottlenecks at Scale</h2>
+<ul>
+<li>Scheduler scanning 10M rows every N seconds → full table scan,
+slow</li>
+<li>Single Redis instance → SPOF</li>
+<li>Worker count is manual → can’t track queue depth automatically</li>
+<li>Single Postgres → write throughput ceiling under sustained load</li>
+</ul>
+<hr />
+<h2 id="high-scale-architecture">High-Scale Architecture</h2>
+<figure>
+<img src="phase_2.png" alt="Architecture" />
+<figcaption aria-hidden="true">Architecture</figcaption>
+</figure>
+<h3 id="scheduler-eventbridge-cronjob">Scheduler → EventBridge
+Cronjob</h3>
+<ul>
+<li>Runs every 10 min, pulls jobs due in next window</li>
+<li>Sets SQS <code>DelayVisibility = expected_run_time - now()</code> so
+messages arrive exactly when due</li>
+<li>Eliminates polling entirely</li>
+<li>Warm standby with DB advisory lock to prevent double-scheduling</li>
+</ul>
+<h3 id="queue-3-sqs-priority-queues">Queue → 3 SQS Priority Queues</h3>
+<ul>
+<li>Urgent / Normal / Low — each with its own DLQ</li>
+<li>No reaper needed — SQS visibility timeout handles worker crashes
+automatically</li>
+<li>DLQ captures permanently failed jobs for inspection</li>
+</ul>
+<h3 id="workers-lambda">Workers → Lambda</h3>
+<ul>
+<li>One invocation per job, no overlap possible</li>
+<li>Provisioned Concurrency on urgent queue — eliminates cold
+starts</li>
+<li>Low priority queue uses on-demand — cold starts acceptable</li>
+<li>Auto-scales with queue depth via reserved concurrency</li>
+</ul>
+<h3 id="rate-limiting-elasticache-redis">Rate Limiting → ElastiCache
+Redis</h3>
+<ul>
+<li>Same Lua token bucket, shared across all Lambda invocations</li>
+<li>Redis replica for HA — auto-elected on failure</li>
+</ul>
+<h3 id="database-sharded-postgres">Database → Sharded Postgres</h3>
+<ul>
+<li>Shard by <code>hash(patient_id) % N</code> — all data for a patient
+on one shard, no cross-shard writes</li>
+<li>Start with time-based partitioning on <code>refresh_jobs</code>
+first (zero app changes)</li>
+<li><code>studies</code> / <code>ehr_endpoints</code> stay unsharded
+(read-only reference data)</li>
+</ul>
+<hr />
+<h2 id="tradeoffs">Tradeoffs</h2>
+<ul>
+<li>Lambda cold starts ~100ms — fine for async jobs, not for
+user-triggered urgent refreshes (mitigated by Provisioned
+Concurrency)</li>
+<li>SQS <code>DelayVisibility</code> max is 15 min — EventBridge
+Scheduler needed for weekly/bi-weekly studies</li>
+<li>Hash sharding makes rebalancing painful — pick shard count with
+headroom upfront</li>
+<li>SQS loses Redis co-location — rate limiter must be a separate
+ElastiCache call per job</li>
+</ul>

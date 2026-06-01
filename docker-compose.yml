@@ -1,0 +1,85 @@
+services:
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: healthex
+      POSTGRES_USER: healthex
+      POSTGRES_PASSWORD: healthex
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U healthex"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  mock-ehr:
+    build: .
+    command: uvicorn src.mock_ehr_api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+
+  seed:
+    build: .
+    command: python -m src.seed
+    environment:
+      DATABASE_URL: postgresql://healthex:healthex@postgres:5432/healthex
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  scheduler:
+    build: .
+    command: python -m src.scheduler
+    environment:
+      DATABASE_URL: postgresql://healthex:healthex@postgres:5432/healthex
+      REDIS_URL: redis://redis:6379/0
+      SCHEDULER_INTERVAL_SECONDS: "30"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m src.worker
+    environment:
+      DATABASE_URL: postgresql://healthex:healthex@postgres:5432/healthex
+      REDIS_URL: redis://redis:6379/0
+      EHR_API_URL: http://mock-ehr:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-ehr:
+        condition: service_started
+    deploy:
+      replicas: 2
+
+  reaper:
+    build: .
+    command: python -m src.reaper
+    environment:
+      DATABASE_URL: postgresql://healthex:healthex@postgres:5432/healthex
+      REDIS_URL: redis://redis:6379/0
+      STALE_THRESHOLD_SECONDS: "300"
+      REAPER_INTERVAL_SECONDS: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
