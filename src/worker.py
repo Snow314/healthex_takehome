@@ -39,6 +39,8 @@ PRIORITY_SCORES = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 
 
 def make_score(priority: str, scheduled_ts: float) -> float:
+    # 1e10 keeps priority bands well above any plausible unix timestamp (~1.7e9),
+    # so urgent jobs always sort before normal ones regardless of scheduled time.
     return PRIORITY_SCORES.get(priority, 2) * 1e10 + scheduled_ts
 
 # Lua token bucket: drip tokens in proportion to elapsed time, decrement if available
@@ -75,6 +77,9 @@ def fetch_job(conn, job_id: str):
 
 
 def mark_in_progress(conn, job_id: str):
+    # WHERE status='pending' is the double-claim guard: if two workers race on
+    # the same job ID (possible because BZPOPMIN is not transactional with Postgres),
+    # only one UPDATE lands rowcount=1; the other sees 0 and skips.
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE refresh_jobs
@@ -86,6 +91,8 @@ def mark_in_progress(conn, job_id: str):
 
 
 def complete_job(conn, job_id: str, elapsed_seconds: float):
+    # All three updates commit together so last_refreshed_at and the rolling
+    # average are never partially applied if the process dies mid-commit.
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE refresh_jobs SET status = 'completed', completed_at = NOW() WHERE id = %s
@@ -99,6 +106,7 @@ def complete_job(conn, job_id: str, elapsed_seconds: float):
             UPDATE ehr_endpoints
             SET
                 response_sample_count     = response_sample_count + 1,
+                -- Welford incremental mean: avoids storing the full sample list
                 avg_response_time_seconds = avg_response_time_seconds
                     + (%s - avg_response_time_seconds) / (response_sample_count + 1)
             WHERE id = (SELECT ehr_endpoint_id FROM refresh_jobs WHERE id = %s)
@@ -107,6 +115,10 @@ def complete_job(conn, job_id: str, elapsed_seconds: float):
 
 
 def fail_job(conn, r: redis.Redis, job_id: str, reason: str, failure_type: str):
+    # Transient failures (503, 429, timeout) use exponential backoff and retry
+    # up to max_attempts. Permanent failures (422) are terminal — no requeue.
+    # Commit must happen before zadd: if the DB rolls back, Redis must not hold
+    # the job ID or workers will pop a phantom that doesn't exist in the DB.
     with conn.cursor() as cur:
         if failure_type == "transient":
             cur.execute("""
@@ -116,6 +128,8 @@ def fail_job(conn, r: redis.Redis, job_id: str, reason: str, failure_type: str):
                     failure_type   = %s::failure_type,
                     failure_reason = %s,
                     next_retry_at  = NOW() + (
+                        -- LEAST caps the index at 3 so all retries beyond that
+                        -- use the same 300s ceiling rather than growing unbounded.
                         CASE LEAST(attempt_count + 1, 3)
                             WHEN 1 THEN 30
                             WHEN 2 THEN 120
@@ -148,6 +162,7 @@ def requeue_job(r: redis.Redis, job_id: str, delay_seconds: int = 60):
 
 
 def check_rate_limit(r: redis.Redis, endpoint_id: str, rate_limit_rpm: int) -> bool:
+    # Lua script runs atomically on the Redis server — no race between read and write.
     key = f"ratelimit:{endpoint_id}"
     allowed = r.eval(RATE_LIMIT_SCRIPT, 1, key, rate_limit_rpm, int(time.time()))
     return bool(allowed)
@@ -165,6 +180,9 @@ def get_endpoint(conn, job_id: str):
 
 
 def poll_status(patient_id: str, ehr_job_id: str, initial_wait: float) -> str:
+    # initial_wait is the endpoint's rolling average response time — skip straight
+    # to polling after that delay rather than hammering the API immediately.
+    # Capped at 3s to prevent a bad average from causing unbounded waits.
     time.sleep(min(initial_wait, 3.0))  # cap at 3s regardless of rolling avg
     for _ in range(STATUS_POLL_RETRIES):
         resp = requests.get(
@@ -194,6 +212,8 @@ def process_job(conn, r: redis.Redis, job_id: str):
     endpoint = get_endpoint(conn, job_id)
     if not check_rate_limit(r, str(endpoint["id"]), endpoint["rate_limit_rpm"]):
         log.warning("Job %s rate limited at endpoint level, requeueing.", job_id)
+        # mark_in_progress already set status=in_progress; reset it before requeueing
+        # so the reaper doesn't reclaim it as stale.
         with conn.cursor() as cur:
             cur.execute("UPDATE refresh_jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL WHERE id = %s", (job_id,))
             conn.commit()

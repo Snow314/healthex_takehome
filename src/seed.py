@@ -13,6 +13,8 @@ DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/healthex")
 
 
 def seed(conn):
+    # All inserts use ON CONFLICT DO NOTHING so this is safe to re-run against
+    # an already-seeded database without duplicating data.
     with conn.cursor() as cur:
 
         # EHR endpoints
@@ -147,6 +149,9 @@ def seed(conn):
         for ext_id, study_id, last_refreshed, consent_expires in legacy_enrollments:
             pid = patient_ids[ext_id]
             if last_refreshed:
+                # f-string for the interval expression because psycopg2 can't
+                # parameterize SQL keywords/functions like NOW() - INTERVAL '2 days'.
+                # The ext_id/study_id values still go through %s to prevent injection.
                 cur.execute(f"""
                     INSERT INTO patient_study_enrollments (patient_id, study_id, last_refreshed_at, consent_expires_at)
                     VALUES (%s, %s, {last_refreshed}, {consent_expires})

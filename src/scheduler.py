@@ -33,10 +33,17 @@ def get_conn():
 
 
 def make_score(priority: str, scheduled_at_ts: float) -> float:
+    # 1e10 keeps priority bands well above any plausible unix timestamp (~1.7e9),
+    # so urgent jobs always sort before normal ones regardless of scheduled time.
     return PRIORITY_SCORES.get(priority, 2) * 1e10 + scheduled_at_ts
 
 
 def schedule_due_patients(conn, r: redis.Redis):
+    # Finds every enrollment whose last_refreshed_at is NULL or older than the
+    # study's refresh_frequency, then inserts a job for each one.
+    # ON CONFLICT DO NOTHING relies on a partial unique index on
+    # (patient_id, study_id) WHERE status IN ('pending', 'in_progress') —
+    # completed/failed jobs don't block new ones for the same enrollment.
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
@@ -83,6 +90,7 @@ TRIGGER_KEY = "config:trigger_now"
 
 
 def get_interval(r: redis.Redis) -> int:
+    # Reads from Redis so the interval can be changed at runtime without a restart.
     val = r.get(SPEED_KEY)
     return int(val) if val else POLL_INTERVAL_SECONDS
 

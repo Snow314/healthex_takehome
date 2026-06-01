@@ -34,6 +34,8 @@ _OUTCOME_CHOICES = [o for o, w in _OUTCOMES for _ in range(w)]
 
 
 def _roll_outcome() -> str:
+    # Each outcome is repeated `weight` times so random.choice gives the right
+    # distribution without needing weights= (not available in all Python versions).
     return random.choice(_OUTCOME_CHOICES)
 
 
@@ -75,7 +77,8 @@ def get_status(patient_id: str, job_id: str):
 
     current = _jobs[job_id]
 
-    # Simulate progress: in_progress jobs complete ~80% of the time when polled
+    # Each poll independently has an 80% chance of completing, so expected
+    # polls before completion ≈ 1.25. Matches the real EHR async polling pattern.
     if current == "in_progress":
         if random.random() < 0.8:
             _jobs[job_id] = "completed"

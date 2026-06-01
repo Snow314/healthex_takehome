@@ -27,6 +27,11 @@ def get_conn():
 
 
 def reap_stale_jobs(conn, r: redis.Redis):
+    # A job is stale if it's been in_progress longer than STALE_THRESHOLD_SECONDS
+    # (default 5 min). This only happens when a worker process dies mid-job — a
+    # healthy worker always transitions the job to completed/failed/pending itself.
+    # Requeued with score=now so the job runs immediately rather than waiting for
+    # its original scheduled time (which has long passed).
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE refresh_jobs SET
