@@ -6,9 +6,6 @@ Deduplication: INSERT ON CONFLICT DO NOTHING — skips patients with an existing
                pending or in_progress job (enforced by partial unique index).
 Queue: jobs are pushed to a Redis sorted set scored by priority + scheduled_at
        so urgent jobs always surface first.
-
-Interval is read from Redis key config:scheduler_interval on each tick so the
-dashboard can adjust speed without a restart.
 """
 import os
 import time
@@ -85,14 +82,21 @@ def schedule_due_patients(conn, r: redis.Redis):
         log.info("Pushed %d new job(s) to queue from %d due patient(s).", pushed, len(due))
 
 
-SPEED_KEY = "config:scheduler_interval"
-TRIGGER_KEY = "config:trigger_now"
-
-
-def get_interval(r: redis.Redis) -> int:
-    # Reads from Redis so the interval can be changed at runtime without a restart.
-    val = r.get(SPEED_KEY)
-    return int(val) if val else POLL_INTERVAL_SECONDS
+def push_pending_retries(conn, r: redis.Redis):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, priority, EXTRACT(EPOCH FROM next_retry_at) AS scheduled_ts
+            FROM refresh_jobs
+            WHERE status = 'pending'
+              AND next_retry_at IS NOT NULL
+              AND next_retry_at <= NOW()
+        """)
+        due = cur.fetchall()
+    for job in due:
+        score = make_score(job["priority"], float(job["scheduled_ts"]))
+        r.zadd(QUEUE_KEY, {str(job["id"]): score})
+    if due:
+        log.info("Pushed %d retry job(s) to queue.", len(due))
 
 
 def run():
@@ -103,15 +107,12 @@ def run():
         while True:
             try:
                 schedule_due_patients(conn, r)
+                push_pending_retries(conn, r)
             except Exception as e:
                 log.error("Scheduler error: %s", e)
                 time.sleep(1)
                 conn = get_conn()
-            # Check for manual trigger or use dynamic interval
-            interval = get_interval(r)
-            triggered = r.getdel(TRIGGER_KEY)
-            if not triggered:
-                time.sleep(interval)
+            time.sleep(POLL_INTERVAL_SECONDS)
     finally:
         conn.close()
 

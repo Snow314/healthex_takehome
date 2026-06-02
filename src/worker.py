@@ -97,11 +97,15 @@ def complete_job(conn, job_id: str, elapsed_seconds: float):
         cur.execute("""
             UPDATE refresh_jobs SET status = 'completed', completed_at = NOW() WHERE id = %s
         """, (job_id,))
+        
+        
         cur.execute("""
             UPDATE patient_study_enrollments SET last_refreshed_at = NOW()
             WHERE patient_id = (SELECT patient_id FROM refresh_jobs WHERE id = %s)
               AND study_id   = (SELECT study_id   FROM refresh_jobs WHERE id = %s)
         """, (job_id, job_id))
+        
+        # We want to keep an average update time per api so we don't GET too often
         cur.execute("""
             UPDATE ehr_endpoints
             SET
@@ -114,13 +118,13 @@ def complete_job(conn, job_id: str, elapsed_seconds: float):
         conn.commit()
 
 
-def fail_job(conn, r: redis.Redis, job_id: str, reason: str, failure_type: str):
-    # Transient failures (503, 429, timeout) use exponential backoff and retry
-    # up to max_attempts. Permanent failures (422) are terminal — no requeue.
-    # Commit must happen before zadd: if the DB rolls back, Redis must not hold
-    # the job ID or workers will pop a phantom that doesn't exist in the DB.
+def fail_job(conn, job_id: str, reason: str, failure_type: str):
+    # Transient failures set next_retry_at and leave status=pending so the
+    # scheduler picks them up on its next tick. Permanent failures (422) are terminal.
     with conn.cursor() as cur:
         if failure_type == "transient":
+            
+            # cap at 3 retries, if over, its a permenant failure
             cur.execute("""
                 UPDATE refresh_jobs SET
                     status         = CASE WHEN attempt_count + 1 >= max_attempts THEN 'failed'::job_status ELSE 'pending'::job_status END,
@@ -139,13 +143,8 @@ def fail_job(conn, r: redis.Redis, job_id: str, reason: str, failure_type: str):
                     claimed_by     = NULL,
                     claimed_at     = NULL
                 WHERE id = %s
-                RETURNING status, priority, EXTRACT(EPOCH FROM next_retry_at) AS retry_ts
             """, (failure_type, reason, job_id))
-            row = cur.fetchone()
             conn.commit()
-            if row and row["status"] == "pending":
-                score = make_score(row["priority"], float(row["retry_ts"]))
-                r.zadd(QUEUE_KEY, {job_id: score})
         else:
             cur.execute("""
                 UPDATE refresh_jobs SET
@@ -154,11 +153,6 @@ def fail_job(conn, r: redis.Redis, job_id: str, reason: str, failure_type: str):
             """, (failure_type, reason, job_id))
             conn.commit()
 
-
-def requeue_job(r: redis.Redis, job_id: str, delay_seconds: int = 60):
-    """Push job back onto the queue with a future score so it's picked up after the delay."""
-    score = time.time() + delay_seconds
-    r.zadd(QUEUE_KEY, {job_id: score})
 
 
 def check_rate_limit(r: redis.Redis, endpoint_id: str, rate_limit_rpm: int) -> bool:
@@ -183,8 +177,12 @@ def poll_status(patient_id: str, ehr_job_id: str, initial_wait: float) -> str:
     # initial_wait is the endpoint's rolling average response time — skip straight
     # to polling after that delay rather than hammering the API immediately.
     # Capped at 3s to prevent a bad average from causing unbounded waits.
+    
+    # we try to skip the time we think it hasn't been processed anyways, so
+    # no extra GET requests
     time.sleep(min(initial_wait, 3.0))  # cap at 3s regardless of rolling avg
     for _ in range(STATUS_POLL_RETRIES):
+        
         resp = requests.get(
             f"{EHR_API_URL}/patients/{patient_id}/data-retrieval/status",
             params={"job_id": ehr_job_id},
@@ -212,19 +210,21 @@ def process_job(conn, r: redis.Redis, job_id: str):
     endpoint = get_endpoint(conn, job_id)
     if not check_rate_limit(r, str(endpoint["id"]), endpoint["rate_limit_rpm"]):
         log.warning("Job %s rate limited at endpoint level, requeueing.", job_id)
-        # mark_in_progress already set status=in_progress; reset it before requeueing
-        # so the reaper doesn't reclaim it as stale.
         with conn.cursor() as cur:
-            cur.execute("UPDATE refresh_jobs SET status = 'pending', claimed_by = NULL, claimed_at = NULL WHERE id = %s", (job_id,))
+            cur.execute("""
+                UPDATE refresh_jobs
+                SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+                    next_retry_at = NOW() + INTERVAL '60 seconds'
+                WHERE id = %s
+            """, (job_id,))
             conn.commit()
-        r.zadd(QUEUE_KEY, {job_id: make_score(job["priority"], time.time() + 60)})
         return
 
     try:
         resp = requests.post(f"{EHR_API_URL}/patients/{patient_id}/$updateData", timeout=10)
     except requests.RequestException as e:
         log.warning("Job %s connection error: %s", job_id, e)
-        fail_job(conn, r, job_id, str(e), "transient")
+        fail_job(conn, job_id, str(e), "transient")
         return
 
     if resp.status_code == 200:
@@ -237,23 +237,23 @@ def process_job(conn, r: redis.Redis, job_id: str):
             complete_job(conn, job_id, elapsed)
         else:
             log.warning("Job %s poll timed out after %.1fs.", job_id, elapsed)
-            fail_job(conn, r, job_id, "Status polling timed out", "transient")
+            fail_job(conn, job_id, "Status polling timed out", "transient")
 
     elif resp.status_code == 429:
         log.warning("Job %s rate limited by EHR endpoint, requeueing with 60s delay.", job_id)
-        fail_job(conn, r, job_id, "Rate limited", "transient")
+        fail_job(conn, job_id, "Rate limited", "transient")
 
     elif resp.status_code == 503:
         log.warning("Job %s transient EHR failure (503), will retry.", job_id)
-        fail_job(conn, r, job_id, "EHR temporarily unavailable", "transient")
+        fail_job(conn, job_id, "EHR temporarily unavailable", "transient")
 
     elif resp.status_code == 422:
         log.error("Job %s permanent failure (422): %s", job_id, resp.json().get("detail", ""))
-        fail_job(conn, r, job_id, resp.json().get("detail", "Permanent failure"), "permanent")
+        fail_job(conn, job_id, resp.json().get("detail", "Permanent failure"), "permanent")
 
     else:
         log.error("Job %s unexpected HTTP %d.", job_id, resp.status_code)
-        fail_job(conn, r, job_id, f"Unexpected HTTP {resp.status_code}", "transient")
+        fail_job(conn, job_id, f"Unexpected HTTP {resp.status_code}", "transient")
 
 
 def run():
@@ -266,14 +266,6 @@ def run():
                 result = r.bzpopmin(QUEUE_KEY, timeout=5)
                 if result:
                     _, job_id_bytes, score = result
-                    # Scores encode priority*1e10 + unix_ts. Extract the timestamp
-                    # to check whether this job's scheduled time has arrived yet.
-                    scheduled_ts = score % 1e10 if score >= 1e10 else score
-                    now = time.time()
-                    if scheduled_ts > now + 0.5:
-                        r.zadd(QUEUE_KEY, {job_id_bytes.decode(): score})
-                        time.sleep(min(scheduled_ts - now, 5))
-                        continue
                     process_job(conn, r, job_id_bytes.decode())
                 else:
                     log.debug("Queue empty, waiting...")
