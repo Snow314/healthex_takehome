@@ -57,3 +57,7 @@
 - Backup Redis Replica only used if the main one goes down and needs to be elected
 - Stale in-progress jobs need a timeout reaper (worker crash recovery)
 - Dead letter queue for permanently failed jobs at scale
+
+## Consistency vs Availability
+- This is a CP system: Postgres is the authoritative source of truth, so if it's down the system stalls rather than risk double-processing or lost state
+- Right tradeoff for EHR data — correctness matters more than staying "available" during a DB outage
