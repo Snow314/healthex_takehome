@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/healthex")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-POLL_INTERVAL_SECONDS = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60"))
+POLL_INTERVAL_SECONDS = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "5"))
 QUEUE_KEY = "queue:refresh_jobs"
 
 PRIORITY_SCORES = {"urgent": 0, "high": 1, "normal": 2, "low": 3}

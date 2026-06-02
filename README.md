@@ -10,7 +10,6 @@ src/
   scheduler.py      # Polls for due patients, creates jobs, pushes to Redis queue
   worker.py         # Claims jobs, calls EHR API, handles retries and rate limiting
   reaper.py         # Recovers stale in-progress jobs from crashed workers
-  looper.py         # Demo: continuously resets enrollments to keep jobs flowing
   seed.py           # Populates DB with patients, studies, enrollments, endpoints
 
 db/
@@ -30,7 +29,6 @@ docs/
 - **Scheduler** — polls for due patients and enqueues refresh jobs
 - **Workers** (x2) — claim jobs from Redis queue, call EHR API, handle retries
 - **Reaper** — recovers stale in-progress jobs from crashed workers
-- **Looper** — demo service that keeps the job flow cycling continuously
 - **Mock EHR API** — simulates Epic/Cerner with realistic failure rates (75% success, 12% transient, 8% rate-limited, 5% permanent)
 
 ## Running
@@ -68,7 +66,6 @@ uvicorn src.mock_ehr_api:app --port 8000 --reload
 python -m src.scheduler
 python -m src.worker
 python -m src.reaper
-python -m src.looper
 ```
 
 ### Dependencies
